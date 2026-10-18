@@ -1,4 +1,3 @@
-
 import asyncio
 import hmac
 import logging
@@ -19,12 +18,19 @@ MAX_IMAGE_PIXELS = 25_000_000
 
 API_KEY = os.environ.get("OCR_API_KEY", "")
 
-# "fr" selects the Latin-language model family.
-# "ar" selects the Arabic-language model family.
-# Add other supported model configurations as needed.
+# Supported script families.
+# Latin covers English, French, German, Portuguese, and other
+# Latin-script languages.
+# Arabic covers Arabic-script text.
+OCR_MODEL_NAMES = {
+    "latin": "latin_PP-OCRv5_mobile_rec",
+    "arabic": "arabic_PP-OCRv5_mobile_rec",
+}
+
+# Start with latin on Render. Once that works, set OCR_LANGS=latin,arabic.
 OCR_LANGS = [
-    lang.strip()
-    for lang in os.environ.get("OCR_LANGS", "fr,ar").split(",")
+    lang.strip().lower()
+    for lang in os.environ.get("OCR_LANGS", "latin").split(",")
     if lang.strip()
 ]
 
@@ -40,15 +46,27 @@ async def lifespan(app: FastAPI):
     if not OCR_LANGS:
         raise RuntimeError("Configure at least one OCR language model")
 
-    logger.info("Loading %d OCR model(s)", len(OCR_LANGS))
+    invalid_langs = set(OCR_LANGS) - set(OCR_MODEL_NAMES)
+
+    if invalid_langs:
+        raise RuntimeError(
+            f"Unsupported OCR_LANGS: {sorted(invalid_langs)}. "
+            "Supported values: latin, arabic."
+        )
+
+    if len(OCR_LANGS) != len(set(OCR_LANGS)):
+        raise RuntimeError("OCR_LANGS contains duplicate entries")
+
+    logger.info("Loading %d mobile OCR model(s)", len(OCR_LANGS))
 
     try:
         for lang in OCR_LANGS:
-            logger.info("Loading OCR model configuration: %s", lang)
+            logger.info("Loading mobile OCR model: %s", lang)
 
             model = await run_in_threadpool(
                 lambda language=lang: PaddleOCR(
-                    lang=language,
+                    text_detection_model_name="PP-OCRv5_mobile_det",
+                    text_recognition_model_name=OCR_MODEL_NAMES[language],
                     use_doc_orientation_classify=False,
                     use_doc_unwarping=False,
                     use_textline_orientation=False,
@@ -56,13 +74,15 @@ async def lifespan(app: FastAPI):
             )
 
             ocr_models[lang] = model
+            logger.info("Successfully loaded OCR model: %s", lang)
 
-        logger.info("All OCR models loaded")
+        logger.info("All configured OCR models loaded")
         yield
 
     except Exception:
         logger.exception("OCR service startup or runtime failure")
         raise
+
     finally:
         ocr_models.clear()
 
@@ -190,8 +210,7 @@ def collect_lines(results, model_lang: str) -> list[dict]:
 
 
 def merge_lines(lines: list[dict]) -> list[dict]:
-    # Each model detects the same receipt regions. Remove highly
-    # overlapping duplicate lines, retaining the higher-confidence result.
+    # Keep the highest-confidence result for overlapping text regions.
     lines.sort(key=lambda line: line["confidence"], reverse=True)
 
     merged = []
@@ -240,43 +259,50 @@ async def extract_text(
 ):
     verify_api_key(authorization)
 
-    allowed_types = {
-        "image/jpeg",
-        "image/png",
-        "image/webp",
-    }
-
-    if file.content_type not in allowed_types:
-        raise HTTPException(
-            status_code=415,
-            detail="Only JPEG, PNG, and WebP images are supported",
-        )
-
-    contents = await read_limited_upload(file)
-
-    image = cv2.imdecode(
-        np.frombuffer(contents, dtype=np.uint8),
-        cv2.IMREAD_COLOR,
-    )
-
-    if image is None:
-        raise HTTPException(status_code=400, detail="Invalid image")
-
-    height, width = image.shape[:2]
-
-    if height * width > MAX_IMAGE_PIXELS:
-        raise HTTPException(
-            status_code=400,
-            detail="Image dimensions are too large",
-        )
-
     try:
+        allowed_types = {
+            "image/jpeg",
+            "image/png",
+            "image/webp",
+        }
+
+        if file.content_type not in allowed_types:
+            raise HTTPException(
+                status_code=415,
+                detail="Only JPEG, PNG, and WebP images are supported",
+            )
+
+        contents = await read_limited_upload(file)
+
+        image = cv2.imdecode(
+            np.frombuffer(contents, dtype=np.uint8),
+            cv2.IMREAD_COLOR,
+        )
+
+        if image is None:
+            raise HTTPException(
+                status_code=400,
+                detail="Invalid image",
+            )
+
+        height, width = image.shape[:2]
+
+        if height * width > MAX_IMAGE_PIXELS:
+            raise HTTPException(
+                status_code=400,
+                detail="Image dimensions are too large",
+            )
+
         all_lines = []
 
-        # Run models sequentially to limit peak resource usage.
+        # Process models sequentially to limit peak inference usage.
         async with ocr_lock:
             for lang, model in ocr_models.items():
-                results = await run_in_threadpool(model.predict, image)
+                results = await run_in_threadpool(
+                    model.predict,
+                    image,
+                )
+
                 all_lines.extend(collect_lines(results, lang))
 
         lines = merge_lines(all_lines)
@@ -289,11 +315,13 @@ async def extract_text(
 
     except HTTPException:
         raise
+
     except Exception:
         logger.exception("OCR inference failed")
         raise HTTPException(
             status_code=500,
             detail="OCR processing failed",
         )
+
     finally:
         await file.close()
